@@ -7,6 +7,8 @@ $(error "Please set DEVKITPRO in your environment. export DEVKITPRO=<path to>/de
 endif
 
 TOPDIR ?= $(CURDIR)
+PROJECT_DIR ?= $(realpath $(dir $(TOPDIR))../)
+PYTHON := `command -v python3`
 
 #-------------------------------------------------------------------------------
 # APP_NAME sets the long name of the application
@@ -14,7 +16,7 @@ TOPDIR ?= $(CURDIR)
 # APP_AUTHOR sets the author of the application
 #-------------------------------------------------------------------------------
 APP_NAME	:=  The Legend of Zelda: A Link to the Past
-APP_SHORTNAME	:= Zelda 3
+APP_SHORTNAME	:= Zelda: ALTTP
 APP_AUTHOR	:=  snesrev & Lywx
 
 include $(DEVKITPRO)/wut/share/wut_rules
@@ -36,10 +38,13 @@ TARGET		:=	zelda3
 BUILD		:=	bin
 SOURCES		:=  $(SRC_DIR) $(SRC_DIR)/snes $(SRC_DIR)/third_party/gl_core $(SRC_DIR)/third_party/opus-1.3.1-stripped
 DATA		:=
-CONTENT		:=  $(TOP_DIR)/content
-ICON		:=	$(TOP_DIR)/icon.jpg
+CONTENT		:=  content
+ICON		:=	icon.jpg
 TV_SPLASH	:=
 DRC_SPLASH	:=
+
+ASSETS_FILE := zelda3_assets.dat
+ASSETS_DAT  := $(CONTENT)/$(ASSETS_FILE)
 
 CFILES := $(wildcard $(SRC_DIR)/*.c $(SRC_DIR)/snes/*.c) $(SRC_DIR)/third_party/gl_core/gl_core_3_1.c $(SRC_DIR)/third_party/opus-1.3.1-stripped/opus_decoder_amalgam.c
 
@@ -163,6 +168,8 @@ else
 
 DEPENDS	:=	$(OFILES:.o=.d)
 
+$(warning OUTPUT: $(OUTPUT), CONTENT: $(CONTENT))
+
 #-------------------------------------------------------------------------------
 # main targets
 #-------------------------------------------------------------------------------
@@ -173,6 +180,14 @@ $(OUTPUT).rpx	:	$(OUTPUT).elf
 $(OUTPUT).elf	:	$(OFILES)
 
 $(OFILES_SRC)	: $(HFILES_BIN)
+
+$(ASSETS_DAT): $(PROJECT_DIR)/tables/dialogue.txt
+	@echo "Compiling game resources"
+	@cd $(PROJECT_DIR)/tables; $(PYTHON) compile_resources.py zelda3.sfc
+	@cp $(PROJECT_DIR)/tables/$(ASSETS_FILE) $(ASSETS_DAT)
+$(PROJECT_DIR)/tables/dialogue.txt:
+	@echo "Extracting game resources"
+	@cd $(PROJECT_DIR)/tables; $(PYTHON) extract_resources.py zelda3.sfc
 
 #-------------------------------------------------------------------------------
 # you need a rule like this for each extension you use as binary data

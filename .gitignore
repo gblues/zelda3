@@ -37,3 +37,4 @@ tables/zelda3_assets.dat
 **/*.elf
 **/*.rpx
 **/*.wuhb
+platform/wiiu/content
