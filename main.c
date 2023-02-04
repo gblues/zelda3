@@ -4,6 +4,17 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <SDL.h>
+
+#ifdef __WIIU__
+#include <coreinit/time.h>
+#include <coreinit/thread.h>
+#include <whb/proc.h>
+#include <whb/log.h>
+#include <whb/log_console.h>
+#include <whb/log_module.h>
+#include <whb/log_cafe.h>
+#endif
+
 #ifdef _WIN32
 #include "platform/win32/volume_control.h"
 #include <direct.h>
@@ -27,7 +38,17 @@
 #include "util.h"
 #include "audio.h"
 
+#ifdef __WIIU__
+#define ERROR_EXIT_CODE 0
+#else
+#define ERROR_EXIT_CODE 1
+#endif
+
 static bool g_run_without_emu = 0;
+
+static bool sdl_inited = false;
+static bool renderer_initialized = false;
+static bool sdl_window_created = false;
 
 void ShaderInit();
 
@@ -43,8 +64,13 @@ static void HandleGamepadAxisInput(int gamepad_id, int axis, int value);
 static void OpenOneGamepad(int i);
 static void HandleVolumeAdjustment(int volume_adjustment);
 static void LoadAssets();
+static void shutDownSdl();
+#ifdef __WIIU__
+static void NORETURN FatalError(const char *error);
+#endif
+#ifndef __WIIU__
 static void SwitchDirectory();
-
+#endif
 
 enum {
   kDefaultFullscreen = 0,
@@ -68,11 +94,14 @@ static int g_curr_fps;
 static int g_ppu_render_flags = 0;
 static int g_snes_width, g_snes_height;
 static int g_sdl_audio_mixer_volume = SDL_MIX_MAXVOLUME;
-static struct RendererFuncs g_renderer_funcs;
+static struct RendererFuncs g_renderer_funcs = {0};
 static uint32 g_gamepad_modifiers;
 static uint16 g_gamepad_last_cmd[kGamepadBtn_Count];
 
 void NORETURN Die(const char *error) {
+#ifdef __WIIU__
+  FatalError(error);
+#endif
 #if defined(NDEBUG) && defined(_WIN32)
   SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, kWindowTitle, error, NULL);
 #endif
@@ -175,8 +204,8 @@ static void DrawPpuFrameWithPerf() {
   g_renderer_funcs.EndDraw();
 }
 
-static SDL_mutex *g_audio_mutex;
-static uint8 *g_audiobuffer, *g_audiobuffer_cur, *g_audiobuffer_end;
+static SDL_mutex *g_audio_mutex = NULL;
+static uint8 *g_audiobuffer = NULL, *g_audiobuffer_cur = NULL, *g_audiobuffer_end = NULL;
 static int g_frames_per_block;
 static uint8 g_audio_channels;
 
@@ -259,6 +288,9 @@ static void SdlRenderer_BeginDraw(int width, int height, uint8 **pixels, int *pi
   }
 }
 
+static SDL_AudioDeviceID sdl_audio_device_id = 0;
+static  SDL_Window *sdl_window = NULL;
+
 static void SdlRenderer_EndDraw() {
 
 //  uint64 before = SDL_GetPerformanceCounter();
@@ -282,6 +314,15 @@ void OpenGLRenderer_Create(struct RendererFuncs *funcs);
 
 #undef main
 int main(int argc, char** argv) {
+  #ifdef __WIIU__
+  WHBProcInit();
+  WHBLogModuleInit();
+  WHBLogCafeInit();
+  #endif
+
+  #ifdef __WIIU__
+  const char *config_file = "fs:/vol/content/zelda3.ini";
+  #else
   argc--, argv++;
   const char *config_file = NULL;
   if (argc >= 2 && strcmp(argv[0], "--config") == 0) {
@@ -290,7 +331,9 @@ int main(int argc, char** argv) {
   } else {
     SwitchDirectory();
   }
+  #endif
   ParseConfigFile(config_file);
+
   LoadAssets();
   LoadLinkGraphics();
 
@@ -330,10 +373,12 @@ int main(int argc, char** argv) {
     g_config.audio_samples = kDefaultSamples;
 
   // set up SDL
+
   if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
     printf("Failed to init SDL: %s\n", SDL_GetError());
-    return 1;
+    goto error;
   }
+  sdl_inited = true;
 
   bool custom_size  = g_config.window_width != 0 && g_config.window_height != 0;
   int window_width  = custom_size ? g_config.window_width  : g_current_window_scale * g_snes_width;
@@ -346,18 +391,20 @@ int main(int argc, char** argv) {
     g_renderer_funcs = kSdlRendererFuncs;
   }
 
-  SDL_Window* window = SDL_CreateWindow(kWindowTitle, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, window_width, window_height, g_win_flags);
-  if(window == NULL) {
+  sdl_window = SDL_CreateWindow(kWindowTitle, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, window_width, window_height, g_win_flags);
+  if(sdl_window == NULL) {
     printf("Failed to create window: %s\n", SDL_GetError());
-    return 1;
+    goto error;
   }
-  g_window = window;
-  SDL_SetWindowHitTest(window, HitTestCallback, NULL);
+  sdl_window_created = true;
+  g_window = sdl_window;
+  SDL_SetWindowHitTest(sdl_window, HitTestCallback, NULL);
 
-  if (!g_renderer_funcs.Initialize(window))
-    return 1;
+  if (!g_renderer_funcs.Initialize(sdl_window))
+    goto error;
+  renderer_initialized = true;
 
-  SDL_AudioDeviceID device = 0;
+
   SDL_AudioSpec want = { 0 }, have;
   g_audio_mutex = SDL_CreateMutex();
   if (!g_audio_mutex) Die("No mutex");
@@ -368,10 +415,10 @@ int main(int argc, char** argv) {
     want.channels = g_config.audio_channels;
     want.samples = g_config.audio_samples;
     want.callback = &AudioCallback;
-    device = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-    if (device == 0) {
+    sdl_audio_device_id = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    if (sdl_audio_device_id == 0) {
       printf("Failed to open audio device: %s\n", SDL_GetError());
-      return 1;
+      goto error;
     }
     g_audio_channels = have.channels;
     g_frames_per_block = (534 * have.freq) / 32000;
@@ -402,7 +449,12 @@ int main(int argc, char** argv) {
   if (g_config.autosave)
     HandleCommand(kKeys_Load + 0, true);
 
+  #ifdef __WIIU__
+  while(WHBProcIsRunning() && running) {
+  #else
   while(running) {
+  #endif
+
     while(SDL_PollEvent(&event)) {
       switch(event.type) {
       case SDL_CONTROLLERDEVICEADDED:
@@ -444,8 +496,8 @@ int main(int argc, char** argv) {
 
     if (g_paused != audiopaused) {
       audiopaused = g_paused;
-      if (device)
-        SDL_PauseAudioDevice(device, audiopaused);
+      if (sdl_audio_device_id)
+        SDL_PauseAudioDevice(sdl_audio_device_id, audiopaused);
     }
 
     if (g_paused) {
@@ -500,21 +552,23 @@ int main(int argc, char** argv) {
   if (g_config.autosave)
     HandleCommand(kKeys_Save + 0, true);
 
-  // clean sdl
-  if (g_config.enable_audio) {
-    SDL_PauseAudioDevice(device, 1);
-    SDL_CloseAudioDevice(device);
-  }
-
-  SDL_DestroyMutex(g_audio_mutex);
-  free(g_audiobuffer);
-
-  g_renderer_funcs.Destroy();
-
-  SDL_DestroyWindow(window);
-  SDL_Quit();
+  shutDownSdl();
+  #ifdef __WIIU__
+  WHBLogCafeDeinit();
+  WHBLogModuleDeinit();
+  WHBProcShutdown();
+  #endif
   //SaveConfigFile();
   return 0;
+
+  error:
+  shutDownSdl();
+  #ifdef __WIIU__
+  WHBLogCafeDeinit();
+  WHBLogModuleDeinit();
+  WHBProcShutdown();
+  #endif
+  return ERROR_EXIT_CODE;
 }
 
 static void RenderDigit(uint8 *dst, size_t pitch, int digit, uint32 color, bool big) {
@@ -812,9 +866,13 @@ uint32 g_asset_sizes[kNumberOfAssets];
 
 static void LoadAssets() {
   size_t length = 0;
+  #ifdef __WIIU__
+  uint8 *data = ReadWholeFile("fs:/vol/content/zelda3_assets.dat", &length);
+  #else
   uint8 *data = ReadWholeFile("tables/zelda3_assets.dat", &length);
   if (!data)
     data = ReadWholeFile("zelda3_assets.dat", &length);
+  #endif
   if (!data) Die("Failed to read zelda3_assets.dat. Please see the README for information about how you get this file.");
 
   static const char kAssetsSig[] = { kAssets_Sig };
@@ -838,6 +896,7 @@ static void LoadAssets() {
 }
 
 // Go some steps up and find zelda3.ini
+#ifndef __WIIU__
 static void SwitchDirectory() {
   char buf[4096];
   if (!getcwd(buf, sizeof(buf) - 32))
@@ -862,3 +921,51 @@ static void SwitchDirectory() {
       pos--;
   }
 }
+#endif
+
+static void shutDownSdl(void) {
+  if(sdl_audio_device_id > 0) {
+    SDL_PauseAudioDevice(sdl_audio_device_id, 1);
+    SDL_CloseAudioDevice(sdl_audio_device_id);
+    sdl_audio_device_id = 0;
+  }
+
+  if(g_audio_mutex) {
+    SDL_DestroyMutex(g_audio_mutex);
+    g_audio_mutex = NULL;
+  }
+
+  if(g_audiobuffer) {
+    free(g_audiobuffer);
+    g_audiobuffer = NULL;
+  }
+
+  if(renderer_initialized) {
+    g_renderer_funcs.Destroy();
+  }
+
+  if(sdl_window_created) {
+    SDL_DestroyWindow(sdl_window);
+  }
+
+  if(sdl_inited) {
+    SDL_Quit();
+  }  
+}
+
+#ifdef __WIIU__
+static void NORETURN FatalError(const char *error) {
+  shutDownSdl();
+  WHBLogConsoleInit();
+  WHBLogPrintf(error);
+
+  while(WHBProcIsRunning()) {
+    WHBLogConsoleDraw();
+    OSSleepTicks(OSMillisecondsToTicks(250));
+  }
+
+   WHBLogConsoleFree();
+   WHBProcShutdown();
+   exit(0);
+}
+#endif
